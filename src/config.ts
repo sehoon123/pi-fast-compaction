@@ -37,6 +37,13 @@ export function splitModelKey(key: string): { provider: string; id: string } {
   return { provider: key.slice(0, slash), id: key.slice(slash + 1) };
 }
 
+/** Accepts "3000", "3,000", "3_000" or "3k". Anything else becomes NaN and fails validation. */
+export function parseCount(value: string): number {
+  const match = value.trim().replace(/[,_]/gu, "").match(/^(\d+(?:\.\d+)?)(k)?$/iu);
+  if (!match) return Number.NaN;
+  return Math.round(Number(match[1]) * (match[2] ? 1000 : 1));
+}
+
 export function parseConfig(value: unknown): Config {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Settings must be an object.");
   const input = value as Record<string, unknown>;
@@ -52,10 +59,10 @@ export function parseConfig(value: unknown): Config {
     if (typeof c.model !== "string") throw new Error("model must be provider/modelId or null.");
     splitModelKey(c.model);
   }
-  if (!THINKING_LEVELS.includes(c.thinking)) throw new Error("Invalid thinking level.");
+  if (!THINKING_LEVELS.includes(c.thinking)) throw new Error(`Invalid thinking level. Use one of: ${THINKING_LEVELS.join(", ")}.`);
   if (!["both", "auto"].includes(c.scope)) throw new Error("scope must be both or auto.");
   if (!Number.isSafeInteger(c.targetWords) || (c.targetWords !== 0 && (c.targetWords < 500 || c.targetWords > 20000))) {
-    throw new Error("targetWords must be 0 (no target) or an integer from 500 to 20000.");
+    throw new Error("targetWords must be off (0) or an integer from 500 to 20000.");
   }
   if (!Number.isSafeInteger(c.maxOutputTokens) || c.maxOutputTokens < 2048 || c.maxOutputTokens > 131072) {
     throw new Error("maxOutputTokens must be an integer from 2048 to 131072.");
@@ -79,7 +86,15 @@ export class ConfigStore {
 
   update(patch: Partial<Omit<Config, "version">>): Config {
     // Re-read before each edit, so another Pi session's unrelated changes are retained.
-    const config = parseConfig({ ...this.load(), ...patch });
+    return this.write(parseConfig({ ...this.load(), ...patch }));
+  }
+
+  /** Explicit recovery path: replaces even a malformed file with defaults. */
+  reset(): Config {
+    return this.write({ ...DEFAULTS });
+  }
+
+  private write(config: Config): Config {
     mkdirSync(dirname(this.path), { recursive: true });
     const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     try {

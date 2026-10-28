@@ -81,8 +81,12 @@ test("actual Pi host: package load, commands, compaction, native/off and cumulat
   // Pi clamps unsupported max to high on this fixture; compaction must not alter it.
   const thinkingAfter = session.thinkingLevel;
   assert.ok(thinkingAfter === "high" || thinkingAfter === "max");
-  assert.ok(manager.getEntries().some((entry) => entry.type === "compaction" && entry.fromHook));
-  assert.ok(manager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "fast-compaction-result"));
+  const fastEntry = manager.getLeafEntry();
+  assert.equal(fastEntry?.type, "compaction", "no metadata entry may follow the compaction");
+  assert.equal((fastEntry as any).fromHook, true);
+  assert.equal((fastEntry as any).details.fastCompaction.route, "fast");
+  // Regression: Pi's guard must still see the compaction as the last entry.
+  await assert.rejects(session.compact(), /Already compacted/u);
   await session.prompt("/compaction off");
   manager.appendMessage({ role: "user", content: "Another follow-up.", timestamp: 3 });
   provider.setResponses([(_context, options, _state, model) => {
@@ -94,22 +98,38 @@ test("actual Pi host: package load, commands, compaction, native/off and cumulat
   assert.match(native.summary, /src\/important\.ts/u);
   assert.match(native.summary, /src\/changed\.ts/u);
   assert.equal(session.thinkingLevel, thinkingAfter);
+  assert.equal(manager.getLeafEntry()?.type, "compaction");
+  await assert.rejects(session.compact(), /Already compacted/u, "also preserved when the override is off");
   await session.prompt("/compaction on");
   manager.appendMessage({ role: "user", content: "Test safe fallback.", timestamp: 4 });
+  const truncated = (_context: unknown, options: SimpleStreamOptions | undefined, _state: unknown, model: { id: string }) => {
+    calls.push({ id: model.id, options });
+    return fauxAssistantMessage("Incomplete checkpoint", { stopReason: "length" });
+  };
   provider.setResponses([
-    (_context, options, _state, model) => {
-      calls.push({ id: model.id, options });
-      return fauxAssistantMessage("Incomplete checkpoint", { stopReason: "length" });
-    },
+    truncated,
+    truncated,
     (_context, options, _state, model) => {
       calls.push({ id: model.id, options });
       return fauxAssistantMessage("## Goal\nSafe fallback checkpoint.");
     },
+    fauxAssistantMessage("Next answer."),
   ]);
   const recovered = await session.compact();
-  assert.deepEqual(calls.slice(-2).map((call) => call.id), ["fast", "main"]);
+  assert.deepEqual(calls.slice(-3).map((call) => call.id), ["fast", "fast", "main"], "condensed fast retry before fallback");
   assert.doesNotMatch(recovered.summary, /Incomplete checkpoint/u);
   assert.match(recovered.summary, /Safe fallback/u);
-  assert.equal((manager.getEntries().at(-1) as any).data.route, "fallback");
+  assert.equal(manager.getLeafEntry()?.type, "compaction");
+  // The deferred fallback record is written when the next prompt starts, before its message.
+  await session.prompt("Next question");
+  const branch = manager.getBranch();
+  const at = branch.findLastIndex((entry) => entry.type === "compaction");
+  const next = branch[at + 1];
+  assert.equal(next?.type === "custom" && next.customType, "fast-compaction-result");
+  assert.ok(branch.slice(at + 2).some((entry) => entry.type === "message" && entry.message.role === "user"), "a context message follows");
+  assert.equal(manager.getLeafEntry()?.type, "message");
+  // Pending records flush in order, so the newest compaction's record is the last one.
+  const records = branch.filter((entry) => entry.type === "custom" && entry.customType === "fast-compaction-result");
+  assert.deepEqual(records.map((entry: any) => entry.data.route), ["main", "fallback"]);
   assert.equal(errors.length, 0, JSON.stringify(errors));
 });

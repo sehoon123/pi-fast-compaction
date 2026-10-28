@@ -1,17 +1,39 @@
 {
   "name": "pi-fast-compaction",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Choose a separate compaction model in Pi, with persistent controls, bounded summaries, safe fallback, and a live status bar.",
   "type": "module",
   "license": "MIT",
   "author": "SH Jung",
-  "repository": { "type": "git", "url": "git+https://github.com/sehoon123/pi-fast-compaction.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sehoon123/pi-fast-compaction.git"
+  },
   "homepage": "https://github.com/sehoon123/pi-fast-compaction#readme",
-  "bugs": { "url": "https://github.com/sehoon123/pi-fast-compaction/issues" },
-  "keywords": ["pi-package", "pi-extension", "compaction", "summarization", "context"],
-  "engines": { "node": ">=22.19.0" },
-  "pi": { "extensions": ["./src/index.ts"] },
-  "files": ["src", "README.md", "LICENSE", "CHANGELOG.md"],
+  "bugs": {
+    "url": "https://github.com/sehoon123/pi-fast-compaction/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compaction",
+    "summarization",
+    "context"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.ts",

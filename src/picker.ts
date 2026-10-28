@@ -4,8 +4,30 @@ import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Input, SelectList, Text, fuzzyFilter } from "@earendil-works/pi-tui";
 import { modelKey, safeLabel } from "./summary.ts";
 
+const REFRESH_TIMEOUT_MS = 3000;
+
+/**
+ * Reload models.json and cached catalogs without network access. A slow or failing
+ * refresh must never block or break the picker: the current snapshot remains usable.
+ */
+export async function refreshLocalModels(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Promise<void> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => { controller.abort(); resolve(); }, REFRESH_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([ctx.modelRegistry.refresh({ allowNetwork: false, signal: controller.signal }), timeout]);
+  } catch {
+    // Keep the cached snapshot.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function pickModel(ctx: ExtensionCommandContext, current: string | null): Promise<string | undefined> {
-  await ctx.modelRegistry.refresh();
+  await refreshLocalModels(ctx);
   const models = ctx.modelRegistry.getAvailable().sort((a, b) => modelKey(a).localeCompare(modelKey(b)));
   if (!models.length) {
     ctx.ui.notify("No available chat models. Configure a provider in Pi first.", "warning");
@@ -24,7 +46,7 @@ export async function pickModel(ctx: ExtensionCommandContext, current: string | 
       const list = new SelectList(items.map((m) => ({
         value: modelKey(m),
         label: `${modelKey(m) === current ? "✓ " : ""}${safeLabel(m.name || m.id)}`,
-        description: `${safeLabel(modelKey(m))} · ${Math.round(m.contextWindow / 1000)}K context`,
+        description: `${safeLabel(modelKey(m), 120)} · ${Math.round(m.contextWindow / 1000)}K context`,
       })), 10, listTheme);
       list.onSelect = (item) => done(item.value);
       list.onCancel = () => done(undefined);

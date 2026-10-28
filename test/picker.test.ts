@@ -44,6 +44,22 @@ test("picker can cancel an empty search result", async (t) => {
   assert.equal(await pickModel(h.ctx, null), undefined);
 });
 
+test("a failing or hanging local refresh never blocks or breaks the picker", async (t) => {
+  const h = harness(t);
+  (h.ctx as any).mode = "rpc";
+  (h.ui as any).select = async (_title: string, options: string[]) => options[0];
+  let options: any;
+  (h.ctx.modelRegistry as any).refresh = async (value: unknown) => { options = value; throw new Error("bad models.json"); };
+  assert.equal(await pickModel(h.ctx, null), "fixture/haiku-test");
+  assert.equal(options.allowNetwork, false, "no network catalog refresh");
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  (h.ctx.modelRegistry as any).refresh = () => new Promise(() => {});
+  const pending = pickModel(h.ctx, null);
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(3000);
+  assert.equal(await pending, "fixture/haiku-test");
+});
+
 test("RPC uses supported selector instead of a custom terminal component", async (t) => {
   const h = harness(t);
   (h.ctx as any).mode = "rpc";

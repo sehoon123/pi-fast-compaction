@@ -54,8 +54,11 @@ The provider/model ID must exist in **your** Pi registry. Custom gateways and lo
 | `/compaction bar on` / `bar off` | Show/hide only this extension's status segment |
 | `/compaction now [focus]` | Compact now under your configured policy |
 | `/compaction main [focus]` | Use Pi's main model **just once**, without changing saved settings |
-| `/compaction status` | Show settings, config path, effective thinking, current run and last result |
+| `/compaction status` | Show settings, config path, effective thinking, warnings, current run and last result |
+| `/compaction reset` | Restore defaults after confirmation; also repairs a malformed settings file |
 | `/compaction help` | Command reference |
+
+Tab completion covers subcommands, values such as thinking levels, and available model IDs. Numbers accept `3,000`, `3_000` and `16k`. Selecting a model warns when its provider has no configured credentials or its context window is smaller than the current coding model's.
 
 Pi's built-in `/compact [focus]` continues to work. The extension adds no model-facing tools.
 
@@ -68,14 +71,18 @@ The extension uses `ctx.ui.setStatus("fast-compaction", ...)`, so it **does not 
 ```text
 Cmp: Claude Haiku 5.5 · low
 Cmp: Claude Haiku 5.5 · compacting 12s
+Cmp: Claude Haiku 5.5 · retry 1/2 · compacting 15s
+Cmp: Claude Haiku 5.5 · condensing · compacting 40s
 Cmp: Claude Haiku 5.5 · low · last 24s
 Cmp: Claude Haiku 5.5 · low · last 48s (fallback)
+Cmp: Claude Haiku 5.5 · low · auto only
+Cmp: claude-haiku-5-5 missing · main
 Cmp: off
 ```
 
-Elapsed time refreshes once per second during compaction, including native/main-model fallback. The last duration covers the whole operation, including a failed fast attempt before fallback. `/compaction status` shows the route, outcome, requested model, model reported by the response when available, and timestamp.
+Elapsed time refreshes once per second during compaction, including native/main-model fallback. The last duration covers the whole operation, including a failed fast attempt before fallback. Warnings (fallback, failure, settings error, missing model) use the theme's warning color. RPC clients receive the same text without colors or per-second updates. `/compaction status` shows the route, outcome, requested model, output tokens, model reported by the response when available, and timestamp.
 
-Durations and outcome metadata are stored as non-context session entries, so the last result survives `/reload` and follows the session branch. Timers stop on completion, failure, cancellation, reload, session replacement, and shutdown. Custom footers must display extension statuses to show this segment.
+The last result survives `/reload` and follows the session branch. For a summary produced by the selected model, the outcome is stored inside Pi's compaction entry. Other outcomes (native/fallback compaction, failures) are stored as non-context metadata entries. **This metadata never becomes the entry directly after a compaction**: Pi uses that position to report "Already compacted" and to avoid back-to-back threshold compactions. Such records are written when the next turn or prompt starts; a record still waiting when Pi exits or you move in `/tree` is dropped rather than misplaced. Timers stop on completion, failure, cancellation, reload, session replacement, and shutdown. Custom footers must display extension statuses to show this segment.
 
 The idle segment shows the **requested** thinking level. Models with a reasoning floor may clamp it; `/compaction status` also shows the effective level. Provider-reported model IDs are not independent attestations of a gateway's actual serving backend.
 
@@ -106,9 +113,14 @@ The extension delegates to Pi's built-in `compact()` rather than implementing it
 - successful summary usage for Pi's session totals;
 - cancellation via the compaction's `AbortSignal`.
 
-Calls go through `ctx.modelRegistry.streamSimple()`: the **selected provider** resolves its own request-time authentication. Main-model credentials are not copied to another provider. One-off summary requests disable cache writes and use Pi's fresh routing IDs. Token-budget providers receive a 1024-token low-thinking budget; adaptive-thinking providers use their effort setting instead.
+Calls go through `ctx.modelRegistry.streamSimple()`: the **selected provider** resolves its own request-time authentication. Main-model credentials are not copied to another provider. One-off summary requests disable cache writes and use Pi's fresh routing IDs. Token-budget providers receive thinking budgets of 1024 tokens for `minimal`/`low` (Anthropic's minimum), 4096 for `medium` and 8192 above; adaptive-thinking providers use their effort setting instead.
 
-Empty output, tool calls, provider errors, truncated (`length`) output, and cancellation are never accepted as successful checkpoints. Failed fast calls fall back by returning control to Pi's normal compaction; user cancellation **does not** trigger fallback. With fallback disabled, failure cancels compaction and writes no replacement checkpoint. The extension does not add a separate retry loop before fallback; provider-managed recovery still applies.
+Empty output, tool calls, provider errors, truncated (`length`) output, and cancellation are never accepted as successful checkpoints. Before falling back, the selected model gets:
+
+- **up to 2 retries for transient errors** (overloaded, rate limits, 5xx, dropped streams) with short backoff. Non-retryable errors such as authentication failures fall back immediately;
+- **one condensed retry when the output cap is hit.** Repeating the same prompt would hit the cap again, so the retry asks for a substantially shorter checkpoint that keeps critical details.
+
+If these fail, control returns to Pi's normal compaction. Only **your** cancellation (Escape) skips fallback; a provider-side abort or timeout counts as a failure and falls back. With fallback disabled, failure cancels compaction, writes no replacement checkpoint, and is recorded as a failure. Usage from failed attempts is not added to Pi's session totals.
 
 Choose a model whose context window can hold the serialized conversation. A conservative byte-based estimate reduces the output budget or falls back when the selected window looks too small; the provider makes the final token-limit decision. **The input is never silently truncated to fit a smaller model.** A 200K summarizer may be unsuitable for a 1M-context coding session. Virtual models and custom adapters may apply their own limits and reasoning behavior.
 
@@ -142,9 +154,11 @@ Example (replace the model with one in your registry):
 }
 ```
 
-The file uses atomic replacement and restrictive permissions. Each edit re-reads the current file. Settings reload on commands, new agent runs and compaction; an already-idle second Pi window may not refresh its footer until its next event. Simultaneous writes from separate processes are last-writer-wins; there is no cross-process locking. Invalid settings are reported, are not silently overwritten, and defer to normal Pi compaction. Repair the file and run `/compaction status` or `/reload`.
+The file uses atomic replacement and restrictive permissions. Each edit re-reads the current file. Settings reload on commands, new agent runs and compaction; an already-idle second Pi window may not refresh its footer until its next event. Simultaneous writes from separate processes are last-writer-wins; there is no cross-process locking. Invalid settings are reported, are not silently overwritten, and defer to normal Pi compaction. Repair the file, or run `/compaction reset` to replace it with defaults.
 
-Only preferences and minimal session outcome metadata are stored by this extension; no API keys, raw provider error bodies, or additional prompt copies. Pi still stores its normal session transcript and compaction summary. Local error notifications may contain provider diagnostics: review terminal logs before sharing them. There is no telemetry.
+The model picker shows the cached model list and reloads `models.json` locally, without network catalog refreshes. A slow or failing reload never blocks the picker.
+
+Only preferences and minimal session outcome metadata are stored by this extension; no API keys, raw provider error bodies, or additional prompt copies. Pi still stores its normal session transcript and compaction summary. Error notifications redact common credential forms (bearer tokens, `key=` query parameters, API-key headers, `sk-`/`AIza`/`ghp_` keys, JWTs), but may still contain other provider diagnostics: review terminal logs before sharing them. Persisted metadata is validated and stripped of control, bidi-override and zero-width characters before display. There is no telemetry.
 
 **Changing the compaction provider sends your serialized session context to that provider.** Use a provider you trust, especially for proprietary code. Nothing in your local configuration, credentials, or sessions is published to GitHub by this package.
 
@@ -156,7 +170,7 @@ npm run check
 npm pack --dry-run
 ```
 
-Tests use synthetic conversations and in-process fixtures: no external model calls, credentials or real user sessions. Coverage includes the actual Pi resource loader and compaction lifecycle, native fallback, split turns, file tracking across off/on, aborts, invalid output, settings persistence, status cleanup, and the searchable picker at narrow widths. CI checks Node.js 22 and 24.
+Tests use synthetic conversations and in-process fixtures: no external model calls, credentials or real user sessions. Coverage includes the actual Pi resource loader and compaction lifecycle, Pi's "Already compacted" guard with the override on and off, native fallback, transient-error and condensed retries, split turns, file tracking across off/on, user versus provider aborts, invalid output, settings persistence and reset, completions, status cleanup, and the searchable picker at narrow widths and with a failing refresh. CI checks Node.js 22 and 24.
 
 ## Update / remove
 
@@ -166,6 +180,8 @@ pi remove git:https://github.com/sehoon123/pi-fast-compaction
 ```
 
 Run `/reload` afterward. Removing the package does not remove your preferences file or historical session entries.
+
+Load only one copy of the extension. For example, do not combine the installed package with `pi -e ./src/index.ts` during development: both copies would handle compaction.
 
 ## License
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
-import { ConfigStore, DEFAULTS, parseConfig, splitModelKey } from "../src/config.ts";
+import { ConfigStore, DEFAULTS, parseConfig, parseCount, splitModelKey } from "../src/config.ts";
 import { temporary } from "./helpers.ts";
 
 test("defaults are conservative and use independent low thinking", () => {
@@ -36,11 +36,20 @@ test("settings persist atomically without editing Pi settings or credentials", (
   if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.doesNotMatch(readFileSync(path, "utf8"), /apiKey|token|password/u);
 });
-test("a malformed settings file is never silently overwritten", (t) => {
+test("a malformed settings file is never silently overwritten, only by explicit reset", (t) => {
   const path = join(temporary(t), "settings.json");
   writeFileSync(path, "{broken");
   const store = new ConfigStore(path);
   assert.throws(() => store.load(), /Cannot read/u);
   assert.throws(() => store.update({ enabled: true }));
   assert.equal(readFileSync(path, "utf8"), "{broken");
+  assert.deepEqual(store.reset(), { ...DEFAULTS });
+  assert.deepEqual(store.load(), { ...DEFAULTS });
+});
+test("friendly counts parse, junk does not", () => {
+  assert.equal(parseCount("3,000"), 3000);
+  assert.equal(parseCount(" 3_000 "), 3000);
+  assert.equal(parseCount("16k"), 16000);
+  assert.equal(parseCount("1.5K"), 1500);
+  for (const bad of ["", "lots", "-5", "1e5", "0x10", "3 000 words"]) assert.ok(Number.isNaN(parseCount(bad)), bad);
 });
