@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import {
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readlinkSync, realpathSync, renameSync, unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, resolve } from "node:path";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type Thinking = (typeof THINKING_LEVELS)[number];
@@ -13,6 +16,8 @@ export interface Config {
   scope: "both" | "auto";
   targetWords: number;
   maxOutputTokens: number;
+  /** Total time the selected model gets (requests, retries and the condensed retry) before giving up. 0 = no limit. */
+  timeoutSeconds: number;
   fallback: boolean;
   showStatus: boolean;
 }
@@ -25,9 +30,12 @@ export const DEFAULTS: Readonly<Config> = Object.freeze({
   scope: "both",
   targetWords: 3000,
   maxOutputTokens: 16384,
+  timeoutSeconds: 300,
   fallback: true,
   showStatus: true,
 });
+
+export const TIMEOUT_RANGE = { min: 30, max: 3600 } as const;
 
 export function splitModelKey(key: string): { provider: string; id: string } {
   const slash = key.indexOf("/");
@@ -42,6 +50,15 @@ export function parseCount(value: string): number {
   const match = value.trim().replace(/[,_]/gu, "").match(/^(\d+(?:\.\d+)?)(k)?$/iu);
   if (!match) return Number.NaN;
   return Math.round(Number(match[1]) * (match[2] ? 1000 : 1));
+}
+
+/** Accepts "300", "90s", "5m" or "off" (0). Anything else becomes NaN and fails validation. */
+export function parseSeconds(value: string): number {
+  const text = value.trim().toLowerCase();
+  if (text === "off" || text === "none" || text === "disabled") return 0;
+  const match = text.replace(/[,_]/gu, "").match(/^(\d+(?:\.\d+)?)\s*(s|sec|secs|m|min|mins)?$/u);
+  if (!match) return Number.NaN;
+  return Math.round(Number(match[1]) * (match[2]?.startsWith("m") ? 60 : 1));
 }
 
 export function parseConfig(value: unknown): Config {
@@ -67,7 +84,28 @@ export function parseConfig(value: unknown): Config {
   if (!Number.isSafeInteger(c.maxOutputTokens) || c.maxOutputTokens < 2048 || c.maxOutputTokens > 131072) {
     throw new Error("maxOutputTokens must be an integer from 2048 to 131072.");
   }
+  if (!Number.isSafeInteger(c.timeoutSeconds)
+    || (c.timeoutSeconds !== 0 && (c.timeoutSeconds < TIMEOUT_RANGE.min || c.timeoutSeconds > TIMEOUT_RANGE.max))) {
+    throw new Error(`timeoutSeconds must be off (0) or an integer from ${TIMEOUT_RANGE.min} to ${TIMEOUT_RANGE.max}.`);
+  }
   return c;
+}
+
+/** The settings file exists but cannot be used. Distinct from validation errors in a requested change. */
+export class ConfigFileError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConfigFileError";
+  }
+}
+
+/**
+ * Where to write so that a symlinked settings file (dotfile managers) stays a symlink:
+ * follow existing links, including a dangling one whose target does not exist yet.
+ */
+function resolveWriteTarget(path: string): string {
+  try { return realpathSync(path); } catch { /* missing file or dangling link */ }
+  try { return resolve(dirname(path), readlinkSync(path)); } catch { return path; }
 }
 
 /** Separate from Pi settings and credentials. Invalid files are never silently overwritten. */
@@ -77,10 +115,11 @@ export class ConfigStore {
 
   load(): Config {
     try {
-      return parseConfig(JSON.parse(readFileSync(this.path, "utf8")));
+      // Editors on Windows may add a byte order mark, which JSON.parse rejects.
+      return parseConfig(JSON.parse(readFileSync(this.path, "utf8").replace(/^\uFEFF/u, "")));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...DEFAULTS };
-      throw new Error(`Cannot read ${this.path}: ${error instanceof Error ? error.message : String(error)}`);
+      throw new ConfigFileError(`Cannot read ${this.path}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -95,11 +134,20 @@ export class ConfigStore {
   }
 
   private write(config: Config): Config {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+    const target = resolveWriteTarget(this.path);
+    mkdirSync(dirname(target), { recursive: true });
+    // The temp file lives next to the target so the rename stays atomic on one filesystem.
+    const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      renameSync(temp, this.path);
+      const fd = openSync(temp, "wx", 0o600);
+      try {
+        writeFileSync(fd, `${JSON.stringify(config, null, 2)}\n`);
+        // Without a flush, a crash right after the rename can leave an empty settings file.
+        try { fsyncSync(fd); } catch { /* not supported on every filesystem */ }
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temp, target);
     } finally {
       try { unlinkSync(temp); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     }

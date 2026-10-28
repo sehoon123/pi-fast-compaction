@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import type { TestContext } from "node:test";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import type { SimpleStreamOptions } from "@earendil-works/pi-ai";
 import {
@@ -9,9 +10,13 @@ import {
 import { ConfigStore } from "../src/config.ts";
 import { temporary } from "./helpers.ts";
 
-// Uses Pi's actual resource loader, Jiti extension mapping, provider runtime, command
-// dispatch, compaction lifecycle and persisted projection. No remote calls or credentials.
-test("actual Pi host: package load, commands, compaction, native/off and cumulative files", async (t) => {
+type Options = { model?: string | null; fallback?: boolean; ui?: object };
+
+/**
+ * Uses Pi's actual resource loader, Jiti extension mapping, provider runtime, command
+ * dispatch, compaction lifecycle and persisted projection. No remote calls or credentials.
+ */
+async function host(t: TestContext, options: Options = {}) {
   const dir = temporary(t);
   const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
@@ -20,7 +25,7 @@ test("actual Pi host: package load, commands, compaction, native/off and cumulat
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
   });
   const store = new ConfigStore(join(dir, "fast-compaction.json"));
-  store.update({ model: "compaction-host/fast" });
+  store.update({ model: options.model === undefined ? "compaction-host/fast" : options.model, fallback: options.fallback ?? true });
   const provider = fauxProvider({
     provider: "compaction-host",
     models: [
@@ -60,7 +65,26 @@ test("actual Pi host: package load, commands, compaction, native/off and cumulat
   });
   t.after(() => session.dispose());
   const errors: unknown[] = [];
-  await session.bindExtensions({ mode: "print", onError: (error) => errors.push(error) });
+  await session.bindExtensions(options.ui
+    ? { uiContext: options.ui as never, mode: "rpc", onError: (error) => errors.push(error) }
+    : { mode: "print", onError: (error) => errors.push(error) });
+  return { store, provider, manager, session, errors };
+}
+
+/** Enough of an RPC-style UI context to observe notifications and statuses. */
+function recordingUi() {
+  const notifications: { message: string; type?: string }[] = [];
+  const statuses: (string | undefined)[] = [];
+  const ui = new Proxy({
+    notify: (message: string, type?: string) => { notifications.push({ message, type }); },
+    setStatus: (_key: string, text: string | undefined) => { statuses.push(text); },
+    select: async () => undefined, confirm: async () => false, input: async () => undefined, editor: async () => undefined,
+  } as Record<string, unknown>, { get: (target, key) => (key in target ? target[key as string] : () => undefined) });
+  return { ui, notifications, statuses };
+}
+
+test("actual Pi host: package load, commands, compaction, native/off and cumulative files", async (t) => {
+  const { store, provider, manager, session, errors } = await host(t);
   assert.ok(session.extensionRunner?.getCommand("compaction"));
   await session.prompt("/compaction words 2500");
   assert.equal(store.load().targetWords, 2500);
@@ -120,16 +144,35 @@ test("actual Pi host: package load, commands, compaction, native/off and cumulat
   assert.doesNotMatch(recovered.summary, /Incomplete checkpoint/u);
   assert.match(recovered.summary, /Safe fallback/u);
   assert.equal(manager.getLeafEntry()?.type, "compaction");
-  // The deferred fallback record is written when the next prompt starts, before its message.
+  // Deferred records never directly follow a compaction; they are written after the next response.
   await session.prompt("Next question");
   const branch = manager.getBranch();
   const at = branch.findLastIndex((entry) => entry.type === "compaction");
   const next = branch[at + 1];
-  assert.equal(next?.type === "custom" && next.customType, "fast-compaction-result");
-  assert.ok(branch.slice(at + 2).some((entry) => entry.type === "message" && entry.message.role === "user"), "a context message follows");
-  assert.equal(manager.getLeafEntry()?.type, "message");
-  // Pending records flush in order, so the newest compaction's record is the last one.
+  assert.equal(next?.type, "message", "a context entry, not our metadata, directly follows the compaction");
+  assert.ok(branch.slice(at + 1).some((entry) => entry.type === "message" && entry.message.role === "user"));
   const records = branch.filter((entry) => entry.type === "custom" && entry.customType === "fast-compaction-result");
+  // Pending records flush in order, so the newest compaction's record is the last one.
   assert.deepEqual(records.map((entry: any) => entry.data.route), ["main", "fallback"]);
+  assert.ok(branch.indexOf(records.at(-1)!) > at + 1);
+  assert.equal((records.at(-1) as any).data.compactionId, branch[at].id, "the record names its compaction");
+  assert.equal(errors.length, 0, JSON.stringify(errors));
+});
+
+test("actual Pi host: a fresh install without a model leaves Pi's compaction alone, even with fallback off", async (t) => {
+  const { ui, notifications, statuses } = recordingUi();
+  const { provider, manager, session, errors } = await host(t, { model: null, fallback: false, ui });
+  const calls: string[] = [];
+  provider.setResponses([(_context, _options, _state, model) => {
+    calls.push(model.id);
+    return fauxAssistantMessage("## Goal\nNative summary.");
+  }]);
+  const compacted = await session.compact();
+  assert.deepEqual(calls, ["main"]);
+  assert.match(compacted.summary, /Native summary/u);
+  assert.equal(manager.getLeafEntry()?.type, "compaction");
+  assert.deepEqual(notifications.map((n) => n.type), ["info"], "only the one-time setup hint");
+  assert.match(notifications[0].message, /no model selected yet.*\/compaction model/u);
+  assert.ok(statuses.every((text) => !/fallback|failed/u.test(text ?? "")), JSON.stringify(statuses));
   assert.equal(errors.length, 0, JSON.stringify(errors));
 });

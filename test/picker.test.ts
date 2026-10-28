@@ -66,3 +66,21 @@ test("RPC uses supported selector instead of a custom terminal component", async
   (h.ctx.ui as any).select = async (_title: string, options: string[]) => options.find((value) => value.endsWith("haiku-test"));
   assert.equal(await pickModel(h.ctx, null), "fixture/haiku-test");
 });
+
+test("a partial name pre-fills the search; the user still confirms the choice", async (t) => {
+  const h = harness(t);
+  (h.ctx.ui as any).custom = async (factory: any) => {
+    let chosen: string | undefined;
+    const component = factory({ requestRender() {} }, { fg: (_color: string, text: string) => text }, getKeybindings(), (value: string | undefined) => { chosen = value; });
+    const lines = component.render(80).join("\n");
+    assert.match(lines, /opus/u, "the query is visible in the search box");
+    assert.match(lines, /Opus test/u);
+    assert.doesNotMatch(lines, /Haiku test/u, "only matches are listed");
+    assert.match(lines, /1M context/u);
+    assert.equal(chosen, undefined, "nothing is selected before Enter");
+    component.handleInput("\r");
+    return chosen;
+  };
+  assert.equal(await pickModel(h.ctx, "fixture/haiku-test", "opus"), "fixture/opus-test");
+  await assert.rejects(pickModel(h.ctx, null, "no-such-model"), /No available chat model matches "no-such-model"/u);
+});

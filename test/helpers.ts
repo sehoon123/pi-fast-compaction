@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { Api, AssistantMessage, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, RegisteredCommand, SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { ConfigStore } from "../src/config.ts";
 import { installExtension } from "../src/extension.ts";
@@ -37,6 +37,22 @@ export function temporary(t: TestContext): string {
   return dir;
 }
 
+type StreamOverride = (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => AssistantMessageEventStream;
+
+/** A provider that never answers. With `honorAbort`, it ends as aborted once its signal fires. */
+export function stalledStream(honorAbort: boolean): StreamOverride {
+  return (_model, _context, options) => {
+    const stream = createAssistantMessageEventStream();
+    if (honorAbort) options?.signal?.addEventListener("abort", () => stream.end(response({ stopReason: "aborted", content: [] })), { once: true });
+    return stream;
+  };
+}
+
+/** Lets pending promise chains (not timers) run. */
+export const settle = () => new Promise((resolve) => setImmediate(resolve));
+/** Lets due real timers run too, e.g. a notice deferred until after Pi redraws the chat. */
+export const afterTimers = () => new Promise((resolve) => setTimeout(resolve, 5));
+
 export function harness(t: TestContext, dependencies: Dependencies = {}) {
   const dir = temporary(t);
   const store = new ConfigStore(join(dir, "settings.json"));
@@ -53,6 +69,7 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
   let clock = 1000;
   let requestMs = 0;
   let onRequest: (() => void) | undefined;
+  let streamOverride: StreamOverride | undefined;
   let compactOptions: Parameters<ExtensionContext["compact"]>[0];
   const pi = {
     on(name: string, handler: (event: any, ctx: ExtensionContext) => any) { handlers.set(name, [...handlers.get(name) ?? [], handler]); },
@@ -62,8 +79,8 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
   const ui = {
     setStatus(_key: string, value: string | undefined) { statuses.push(value); },
     notify(text: string, type?: string) { notifications.push({ text, type }); },
-    select: async (): Promise<string | undefined> => undefined,
-    input: async (): Promise<string | undefined> => undefined,
+    select: async (_title: string, _options: string[]): Promise<string | undefined> => undefined,
+    input: async (_title: string, _placeholder?: string): Promise<string | undefined> => undefined,
     confirm: async () => true,
     theme: { fg: (_color: string, text: string) => text },
   };
@@ -78,6 +95,7 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
         requests.push({ model, context, options });
         clock += requestMs;
         onRequest?.();
+        if (streamOverride) return streamOverride(model, context, options);
         const stream = createAssistantMessageEventStream();
         stream.end(queue.length > 1 ? queue.shift()! : queue[0]);
         return stream;
@@ -103,6 +121,8 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
     /** Simulated provider latency, applied to the injected clock on each request. */
     setRequestMs: (value: number) => { requestMs = value; },
     setOnRequest: (fn: (() => void) | undefined) => { onRequest = fn; },
+    /** Replaces the provider stream, e.g. to stall or to stream deltas. */
+    setStream: (fn: StreamOverride | undefined) => { streamOverride = fn; },
     getCompactOptions: () => compactOptions,
   };
 }

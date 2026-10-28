@@ -2,9 +2,10 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Input, SelectList, Text, fuzzyFilter } from "@earendil-works/pi-tui";
-import { modelKey, safeLabel } from "./summary.ts";
+import { describeContext, modelKey, safeLabel } from "./summary.ts";
 
 const REFRESH_TIMEOUT_MS = 3000;
+const SUGGESTION_LIMIT = 6;
 
 /**
  * Reload models.json and cached catalogs without network access. A slow or failing
@@ -13,9 +14,9 @@ const REFRESH_TIMEOUT_MS = 3000;
 export async function refreshLocalModels(ctx: Pick<ExtensionCommandContext, "modelRegistry">): Promise<void> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Not unref'd: this bound must settle the wait even if the refresh holds no I/O handle.
   const timeout = new Promise<void>((resolve) => {
     timer = setTimeout(() => { controller.abort(); resolve(); }, REFRESH_TIMEOUT_MS);
-    timer.unref?.();
   });
   try {
     await Promise.race([ctx.modelRegistry.refresh({ allowNetwork: false, signal: controller.signal }), timeout]);
@@ -26,27 +27,45 @@ export async function refreshLocalModels(ctx: Pick<ExtensionCommandContext, "mod
   }
 }
 
-export async function pickModel(ctx: ExtensionCommandContext, current: string | null): Promise<string | undefined> {
-  await refreshLocalModels(ctx);
+const searchText = (m: Model<Api>) => `${m.name} ${modelKey(m)}`;
+
+/**
+ * Let the user choose a model. `query` pre-fills the search (e.g. a partial ID typed after
+ * `/compaction model`): matches are offered, never selected silently, because the choice
+ * decides which provider receives the conversation.
+ */
+export async function pickModel(
+  ctx: ExtensionCommandContext, current: string | null, query?: string, options: { refresh?: boolean } = {},
+): Promise<string | undefined> {
+  if (options.refresh !== false) await refreshLocalModels(ctx);
   const models = ctx.modelRegistry.getAvailable().sort((a, b) => modelKey(a).localeCompare(modelKey(b)));
   if (!models.length) {
     ctx.ui.notify("No available chat models. Configure a provider in Pi first.", "warning");
     return;
   }
+  const matches = query ? fuzzyFilter(models, query, searchText) : models;
+  if (!matches.length) {
+    throw new Error(`No available chat model matches "${safeLabel(query ?? "", 60)}". Run /compaction model to browse them.`);
+  }
+  if (!ctx.hasUI) {
+    const closest = matches.slice(0, SUGGESTION_LIMIT).map((m) => safeLabel(modelKey(m), 120)).join(", ");
+    throw new Error(`Use /compaction model provider/modelId outside interactive mode.${query ? ` Closest: ${closest}` : ""}`);
+  }
   if (ctx.mode !== "tui") {
-    if (!ctx.hasUI) throw new Error("Use /compaction model provider/modelId outside interactive mode.");
-    return ctx.ui.select("Compaction model (coding model is unchanged)", models.map(modelKey));
+    const title = query ? `Models matching "${safeLabel(query, 40)}" (coding model is unchanged)` : "Compaction model (coding model is unchanged)";
+    return ctx.ui.select(title, matches.map(modelKey));
   }
   return ctx.ui.custom<string | undefined>((tui, theme, kb, done) => {
     const container = new Container();
     const input = new Input({ placeholder: "Search models and providers…" });
     const listTheme = getSelectListTheme();
-    let filtered = models;
+    if (query) input.setValue(query);
+    let filtered = query ? matches : models;
     const makeList = (items: Model<Api>[]) => {
       const list = new SelectList(items.map((m) => ({
         value: modelKey(m),
         label: `${modelKey(m) === current ? "✓ " : ""}${safeLabel(m.name || m.id)}`,
-        description: `${safeLabel(modelKey(m), 120)} · ${Math.round(m.contextWindow / 1000)}K context`,
+        description: `${safeLabel(modelKey(m), 120)} · ${describeContext(m.contextWindow)}`,
       })), 10, listTheme);
       list.onSelect = (item) => done(item.value);
       list.onCancel = () => done(undefined);
@@ -75,7 +94,7 @@ export async function pickModel(ctx: ExtensionCommandContext, current: string | 
           if (!filtered.length && kb.matches(data, "tui.select.cancel")) done(undefined);
         } else {
           input.handleInput(data);
-          filtered = fuzzyFilter(models, input.getValue(), (m) => `${m.name} ${modelKey(m)}`);
+          filtered = fuzzyFilter(models, input.getValue(), searchText);
           list = makeList(filtered);
           rebuild();
         }
