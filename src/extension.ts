@@ -262,7 +262,8 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
         text = `Cmp: ${safeLabel(model.name || model.id)} · ${effectiveThinking(model, config.thinking)}${config.scope === "auto" ? " · auto only" : ""}`;
       } else {
         tone = "warning";
-        text = `Cmp: ${safeLabel(splitModelKey(config.model).id)} missing · main`;
+        // With fallback off, a missing model cancels compaction rather than using the main model.
+        text = `Cmp: ${safeLabel(splitModelKey(config.model).id)} missing · ${config.fallback ? "main" : "fallback off"}`;
       }
     }
     if (last) {

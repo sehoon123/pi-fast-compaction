@@ -360,6 +360,9 @@ test("status shows missing models, auto-only scope, hides on request, and clears
   h.store.update({ model: "gone/model" });
   await h.emit("session_start");
   assert.match(h.statuses.at(-1)!, /model missing · main/u);
+  await h.command("fallback off");
+  assert.match(h.statuses.at(-1)!, /model missing · fallback off/u, "compaction would be cancelled, not run with the main model");
+  await h.command("fallback on");
   h.store.update({ model: "fixture/haiku-test", scope: "auto" });
   await h.emit("before_agent_start");
   assert.match(h.statuses.at(-1)!, /auto only/u);

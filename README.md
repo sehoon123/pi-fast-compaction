@@ -20,7 +20,7 @@ Run `/reload` in existing sessions. Then:
 /compaction model
 ```
 
-Type to search available chat models, use arrow keys to move, Enter to select, and Escape to cancel. The picker shows providers and context sizes. It does not change the coding model or restrict you to Pi's model-cycling scope. In RPC mode it uses the client's regular selector instead of a terminal component. A partial name such as `/compaction model haiku` opens the picker already filtered; a match is never selected without your confirmation, because the choice decides which provider receives your conversation.
+Type to search available chat models, use arrow keys to move, Enter to select, and Escape to cancel. The picker shows providers and context sizes. It does not change the coding model or restrict you to Pi's model-cycling scope. In RPC mode it uses the client's regular selector instead of a terminal component. A partial name such as `/compaction model haiku` opens the picker already filtered; a match is never selected without your confirmation, because the choice decides which provider receives your conversation. Outside interactive mode, the closest matches are listed instead.
 
 Or select an exact model:
 
@@ -60,11 +60,16 @@ The provider/model ID must exist in **your** Pi registry. Custom gateways and lo
 | `/compaction reset` | Restore defaults after confirmation; also repairs a malformed settings file |
 | `/compaction help` | Command reference |
 
-Subcommands and values are case-insensitive, and a typo gets a suggestion (`/compaction thnking` → *Did you mean /compaction thinking?*). Tab completion covers subcommands, values such as thinking levels, and available model IDs. Numbers accept `3,000`, `3_000` and `16k`. `words`, `tokens` and `timeout` without a value ask for one. Every change confirms what it did. Selecting a model warns when its provider has no configured credentials or its context window is smaller than the current coding model's. Settings that cannot fit together — e.g. a 20,000-word target under a 16K output cap — are flagged when you change them and in `/compaction status`.
+- Subcommands and setting values are case-insensitive (exact model IDs are not; a partial name searches case-insensitively). A typo gets a suggestion: `/compaction thnking` → *Did you mean /compaction thinking?*
+- Without a value, `thinking`, `scope`, `fallback` and `bar` open a selector, and `words`, `tokens` and `timeout` ask for input.
+- Numbers accept `3,000`, `3_000` and `16k`; durations accept `300`, `90s` and `5m`.
+- Tab completion covers subcommands, values such as thinking levels, and available model IDs.
+
+Every change confirms what it did. Selecting a model warns when its provider has no configured credentials or its context window is smaller than the current coding model's. Settings that cannot fit together, e.g. a 20,000-word target under a 16K output cap, are flagged when you change them and in `/compaction status`.
 
 Pi's built-in `/compact [focus]` continues to work. The extension adds no model-facing tools.
 
-Manual `now` and `main` actions require the agent to be idle. A settings change during a compaction applies to the **next** compaction, not to the in-flight request. The one-shot main-model action does not use the extension's word target or output cap.
+Manual `now` and `main` actions require the agent to be idle. A settings change during a compaction applies to the **next** compaction, not to the in-flight request. The one-shot main-model action does not use the extension's word target, output cap or time limit.
 
 ## Status bar
 
@@ -75,23 +80,26 @@ Cmp: Claude Haiku 5.5 · low
 Cmp: Claude Haiku 5.5 · compacting 12s · ~1.8K tokens
 Cmp: Claude Haiku 5.5 · retry 1/2 · compacting 15s
 Cmp: Claude Haiku 5.5 · condensing · compacting 40s
+Cmp: Claude Opus 5.5 · fallback · compacting 1m05s
 Cmp: Claude Haiku 5.5 · low · last 24s
 Cmp: Claude Haiku 5.5 · low · last 48s (fallback)
 Cmp: Claude Haiku 5.5 · low · auto only
+Cmp: choose model · main
 Cmp: claude-haiku-5-5 missing · main
+Cmp: claude-haiku-5-5 missing · fallback off
 Cmp: off
 ```
 
-Elapsed time refreshes once per second during compaction, including native/main-model fallback. While the selected model streams, an approximate token count shows that it is making progress rather than stalled. The last duration covers the whole operation, including a failed fast attempt before fallback. Warnings (fallback, failure, settings error, missing model) use the theme's warning color. Pi redraws the chat when a compaction completes, which would erase a warning shown during it, so the reason for a fallback is repeated right after the redraw. RPC clients receive the same text without colors or per-second updates. `/compaction status` shows the route, outcome, requested model, output tokens, model reported by the response when available, and timestamp.
+`main` means Pi's normal compaction with the coding model will be used. A missing model with fallback off shows `fallback off` instead, because compaction is then cancelled. Elapsed time refreshes once per second during compaction, including native/main-model fallback. While the selected model streams, an approximate token count shows that it is making progress rather than stalled. The last duration covers the whole operation, including a failed fast attempt before fallback. Warnings (fallback, failure, settings error, missing model) use the theme's warning color. Pi redraws the chat when a compaction completes, which would erase a warning shown during it, so the reason for a fallback is repeated right after the redraw. RPC clients receive the same text without colors or per-second updates. `/compaction status` shows the route, outcome, requested model, output tokens, model reported by the response when available, and timestamp.
 
 The last result survives `/reload` and follows the session branch. For a summary produced by the selected model, the outcome is stored inside Pi's compaction entry. Other outcomes (native/fallback compaction, failures) are stored as non-context metadata entries. **This metadata never becomes the entry directly after a compaction**: Pi uses that position to report "Already compacted" and to avoid back-to-back threshold compactions. Such records wait until another entry has followed the compaction, and are written after the next response; each names the compaction it describes, so a late record never overrides a newer result. A record still waiting when Pi exits right after compacting, or when you move in `/tree`, is dropped rather than misplaced. Timers stop on completion, failure, cancellation, reload, session replacement, and shutdown, and a failing status display can never take Pi down. Custom footers must display extension statuses to show this segment.
 
-The idle segment shows the thinking level **actually used**: models with a reasoning floor or ceiling clamp the requested level, which `/compaction status` and the confirmation of `/compaction thinking` also show. Provider-reported model IDs are not independent attestations of a gateway's actual serving backend.
+The idle segment shows the thinking level **actually sent**: a model with a reasoning floor or ceiling clamps the requested level, and a non-reasoning model shows `off`. `/compaction status` and `/compaction thinking` show both levels. Provider-reported model IDs are not independent attestations of a gateway's actual serving backend.
 
 ## Defaults and summary quality
 
 - Enabled, after you select a model.
-- Independent **low** reasoning, not your coding model's `max`.
+- Independent **low** reasoning, whatever the coding model's level.
 - Both automatic and manual compaction.
 - **3,000-word soft target for summary prose.** Critical details take priority.
 - **16,384-token output cap per request**, including thinking where the adapter honors model caps.
@@ -125,7 +133,7 @@ Empty output, tool calls, provider errors, truncated (`length`) output, and canc
 
 If these fail, control returns to Pi's normal compaction. Only **your** cancellation (Escape) skips fallback; a provider-side abort or timeout counts as a failure and falls back.
 
-**Time limit.** Without one, a stalled provider could hold compaction for Pi's HTTP idle timeout on every attempt — easily many minutes. The selected model gets `timeout` seconds in total (default 300); then its request is aborted and Pi's normal compaction takes over, without further retries. Escape and the limit both take effect immediately, even with an adapter that ignores cancellation. Slow local summarizers may need `/compaction timeout 900` or `off`. The limit does not apply to Pi's own (fallback) compaction.
+**Time limit.** Without one, a stalled provider could hold compaction for Pi's HTTP idle timeout on every attempt — easily many minutes. The selected model gets `timeout` seconds in total (default 300); then its request is aborted and, without further retries, Pi's normal compaction takes over (with fallback off, compaction is cancelled instead). Escape and the limit both take effect immediately, even with an adapter that ignores cancellation. Slow local summarizers may need `/compaction timeout 900` or `off`. The limit does not apply to Pi's own (fallback) compaction.
 
 **Implausible replies are rejected.** Some providers report a refusal as ordinary text with a normal stop. A reply that has no Markdown heading and fewer than 400 characters is treated as a failure, not saved as the checkpoint of your whole conversation.
 
@@ -166,7 +174,7 @@ Example (replace the model with one in your registry):
 
 The file uses atomic, flushed replacement and restrictive permissions; a symlinked file (dotfile managers) stays a symlink, and a byte order mark from a Windows editor is accepted. Each edit re-reads the current file. Files from 0.2.0 load unchanged, with the new time limit at its default. Settings reload on commands, new agent runs and compaction; an already-idle second Pi window may not refresh its footer until its next event. Simultaneous writes from separate processes are last-writer-wins; there is no cross-process locking. Invalid settings are reported, are not silently overwritten, and defer to normal Pi compaction. Repair the file, or run `/compaction reset` to replace it with defaults; commands that cannot save because of it say so.
 
-The model picker shows the cached model list and reloads `models.json` locally, without network catalog refreshes. A slow or failing reload never blocks the picker.
+The model picker shows the cached model list and reloads `models.json` locally, without network catalog refreshes. A slow reload delays the picker by at most 3 seconds; a failing one is ignored.
 
 Only preferences and minimal session outcome metadata are stored by this extension; no API keys, raw provider error bodies, or additional prompt copies. Pi still stores its normal session transcript and compaction summary. Error notifications redact common credential forms (bearer tokens, `key=` query parameters, API-key headers, `sk-`/`AIza`/`ghp_` keys, JWTs), but may still contain other provider diagnostics: review terminal logs before sharing them. Persisted metadata is validated and stripped of control, bidi-override and zero-width characters before display. There is no telemetry.
 
@@ -180,7 +188,13 @@ npm run check
 npm pack --dry-run
 ```
 
-Tests use synthetic conversations and in-process fixtures: no external model calls, credentials or real user sessions. Coverage includes the actual Pi resource loader and compaction lifecycle, Pi's "Already compacted" guard with the override on and off, a fresh install without a model, native fallback, transient-error and condensed retries, stalled providers and the time limit (including adapters that ignore cancellation), refusals and other invalid output, split turns, file tracking across off/on, user versus provider aborts, unknown model limits, settings persistence, symlinks and reset, command parsing and completions, status cleanup and a failing status display, and the searchable picker at narrow widths, pre-filtered, and with a failing refresh. The time limit was additionally verified against the real host with a stalled provider. CI checks Node.js 22 and 24.
+Tests use synthetic conversations and in-process fixtures: no external model calls, credentials or real user sessions. CI checks Node.js 22 and 24. Coverage includes:
+
+- the actual Pi resource loader and compaction lifecycle, including Pi's "Already compacted" guard with the override on and off, and a fresh install without a model;
+- native fallback, transient-error and condensed retries, stalled providers and the time limit (also with adapters that ignore cancellation), user versus provider aborts;
+- refusals and other invalid output, split turns, file tracking across off/on, unknown model limits;
+- settings persistence, symlinks and reset; command parsing and completions;
+- status cleanup and a failing status display; the searchable picker at narrow widths, pre-filtered, and with a failing refresh.
 
 ## Update / remove
 
@@ -189,7 +203,7 @@ pi update git:https://github.com/sehoon123/pi-fast-compaction
 pi remove git:https://github.com/sehoon123/pi-fast-compaction
 ```
 
-Run `/reload` afterward. Removing the package does not remove your preferences file or historical session entries.
+Run `/reload` afterward, in **every** open Pi session. Once a newer version saves your settings, an older version still running elsewhere may reject the file (0.2.0 does not know `timeoutSeconds`) and use normal Pi compaction until reloaded. Removing the package does not remove your preferences file or historical session entries.
 
 Load only one copy of the extension. For example, do not combine the installed package with `pi -e ./src/index.ts` during development: both copies would handle compaction.
 

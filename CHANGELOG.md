@@ -1,11 +1,21 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+
+- With fallback off, the status bar showed `missing · main` for a selected model that is missing from Pi's registry, although compaction is then cancelled rather than run with the main model. It now shows `missing · fallback off`.
+
+### Documentation
+
+- README: input conveniences as a list, status examples for a fallback in progress and a fresh install, the time limit with fallback off, the picker's 3-second reload bound, non-interactive model search, and reloading every Pi session after an update.
+
 ## 0.3.0
 
 ### Fixed
 
 - **Fresh installs warned on every compaction, and could block compaction entirely.** With no model selected yet, every compaction reported "Fast compaction unavailable; falling back", recorded a fallback, and with fallback off was **cancelled** — including automatic and overflow compaction. Without a model, Pi's compaction now runs untouched, with one hint per session.
-- **A stalled provider could hang compaction indefinitely**, or for Pi's HTTP idle timeout on every retry. A new time limit (default 5 minutes, `/compaction timeout`) aborts the selected model and falls back. Escape and the limit take effect immediately, even if a provider adapter ignores cancellation.
+- **A stalled provider could hold compaction for Pi's HTTP idle timeout on every attempt and retry**, or indefinitely with that timeout disabled. A new time limit (default 5 minutes, `/compaction timeout`) aborts the selected model and falls back. Escape and the limit take effect immediately, even if a provider adapter ignores cancellation.
 - **An exception in the status timer could terminate Pi**, e.g. after the extension context became stale. Status rendering can no longer throw, and the manual-compaction error callback can no longer cause an unhandled rejection.
 - **Refusals could become the checkpoint.** OpenAI Responses reports a refusal as ordinary text; a short reply without any heading is now rejected and falls back.
 - **Virtual models (and other models reporting 0 for unknown limits) always fell back** with a misleading "context window is too small". Unknown limits are no longer enforced; context labels say "unknown context size", and errors distinguish context window from output limit.
@@ -23,13 +33,13 @@
 
 - Live progress in the status bar (`~1.8K tokens`) while the selected model streams, so a slow model can be told apart from a stalled one.
 - The status bar shows the thinking level actually used after model clamping; `/compaction thinking` says when a model clamps the request.
-- Commands are case-insensitive, confirm what changed, ask for a missing value (`words`, `tokens`, `timeout`), and suggest the intended subcommand for typos. Select prompts show the current value.
+- Subcommands and setting values are case-insensitive; commands confirm what changed, ask for a missing value (`words`, `tokens`, `timeout`), and suggest the intended subcommand for typos. Select prompts show the current value.
 - `/compaction model <partial name>` opens the picker pre-filtered, never selecting a match silently; outside interactive mode it lists the closest matches. A mistyped ID reloads `models.json` once.
 - Settings that cannot fit together, such as a word target that exceeds the output cap, are flagged on change and in `/compaction status`.
 - When the selected model succeeds, the compaction's usage covers all of its attempts, including a discarded over-length one.
 - Commands that fail because of an unreadable settings file explain how to recover.
 - Context sizes read `1M` instead of `1000K`.
-- Real-host test for a fresh install without a model; real-host verification of the time limit with a stalled provider.
+- Real-host test for a fresh install without a model.
 
 ## 0.2.0
 
