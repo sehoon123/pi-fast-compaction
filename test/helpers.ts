@@ -104,10 +104,15 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
     isIdle: () => true,
     compact(options: typeof compactOptions) { compactOptions = options; },
   } as unknown as ExtensionCommandContext;
-  installExtension(pi, { store, now: () => clock, retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 }, ...dependencies });
+  const install = () => installExtension(pi, { store, now: () => clock, retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 }, ...dependencies });
+  install();
+  /** Like Pi's runner: handlers run in order, and the last non-undefined result wins. */
   async function emit(name: string, value: any = {}) {
     let result: any;
-    for (const handler of handlers.get(name) ?? []) result = await handler(value, ctx);
+    for (const handler of handlers.get(name) ?? []) {
+      const handled = await handler(value, ctx);
+      if (handled !== undefined) result = handled;
+    }
     return result;
   }
   t.after(() => emit("session_shutdown"));
@@ -124,5 +129,7 @@ export function harness(t: TestContext, dependencies: Dependencies = {}) {
     /** Replaces the provider stream, e.g. to stall or to stream deltas. */
     setStream: (fn: StreamOverride | undefined) => { streamOverride = fn; },
     getCompactOptions: () => compactOptions,
+    /** Loads a second copy into the same session, as `pi -e` next to the installed package would. */
+    installAgain: install,
   };
 }

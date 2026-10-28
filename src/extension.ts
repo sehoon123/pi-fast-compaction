@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessageEvent, Model, RetryCallbacks, RetryPolicy, Usage } from "@earendil-works/pi-ai";
@@ -18,7 +19,7 @@ import {
   formatDuration, formatTokens, modelKey, outputBudget, readRunRecord, reducedThinking, safeError, safeLabel,
   sizingAdvice, THINKING_BUDGETS,
 } from "./summary.ts";
-import type { RunRecord } from "./summary.ts";
+import type { Preparation, RunRecord } from "./summary.ts";
 
 export { THINKING_BUDGETS };
 
@@ -26,6 +27,24 @@ const STATUS_KEY = "fast-compaction";
 const STATS_TYPE = "fast-compaction-result";
 /** Transient provider failures (overloaded, 5xx, dropped streams) retry before any fallback. */
 export const DEFAULT_RETRY: RetryPolicy = { enabled: true, maxRetries: 2, baseDelayMs: 1500, maxAgentDelayMs: 10_000 };
+/** Failed runs in a row before the selected model is paused. A time-out pauses it at once. */
+const FAILURES_BEFORE_PAUSE = 3;
+/** First pause; each further pause without a success in between doubles, up to the maximum. */
+const PAUSE_BASE_MS = 10 * 60_000;
+const PAUSE_MAX_MS = 60 * 60_000;
+
+/**
+ * One active copy per session. Two loaded copies (e.g. the installed package plus `pi -e`)
+ * would both summarize every compaction. Keyed by the session, so several sessions in one
+ * SDK process are unaffected.
+ */
+const OWNERS_KEY = Symbol.for("pi-fast-compaction.session-owners");
+const owners = ((globalThis as unknown as Record<symbol, WeakMap<object, symbol> | undefined>)[OWNERS_KEY] ??= new WeakMap<object, symbol>());
+
+/** Pi's compact() takes positional arguments up to `callbacks` (index 10); appended parameters stay compatible. */
+export function isCompatibleCompact(fn: unknown): boolean {
+  return typeof fn === "function" && fn.length >= 11;
+}
 
 const SUBCOMMANDS = [
   ["on", false, "Use the selected compaction model"],
@@ -87,6 +106,10 @@ interface Run {
   error?: string;
   /** Shown once the compaction completes. */
   hint?: string;
+  /** The selected model ran out of time (counts toward pausing it). */
+  timedOut?: boolean;
+  /** Skipped because the selected model is paused after failures. */
+  paused?: boolean;
 }
 
 export interface Dependencies {
@@ -97,6 +120,26 @@ export interface Dependencies {
 }
 
 type Tone = "dim" | "accent" | "warning";
+type TallyKey = RunRecord["route"] | "failed" | "cancelled";
+const TALLY_LABELS: [TallyKey, string][] = [
+  ["fast", "fast"], ["fallback", "fallback"], ["main", "main model"], ["other-extension", "other extension"],
+  ["failed", "failed"], ["cancelled", "cancelled"],
+];
+
+/** Local wall-clock time, e.g. 14:05. */
+function clockTime(ms: number): string {
+  const date = new Date(ms);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function formatAge(ms: number): string | undefined {
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+}
 
 function abortError(): Error {
   return new DOMException("Compaction cancelled", "AbortError");
@@ -208,6 +251,21 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
   let manualFailureReported = false;
   let hintedNoModel = false;
   let registry: ExtensionContext["modelRegistry"] | undefined;
+  const instance = Symbol("pi-fast-compaction");
+  /** Another copy owns this session: stay out of compaction, status and commands. */
+  let inactive = false;
+  const apiCompatible = dependencies.summarize !== undefined || isCompatibleCompact(compact);
+  let warnedIncompatible = false;
+  /** Pi's split-turn format no longer matches; summarize halves sequentially, as Pi does. */
+  let parallelSplitUnsupported = false;
+  /** Last status text set, to skip redundant updates (each one redraws the TUI or sends an RPC message). */
+  let shown: string | undefined | null = null;
+  let failures = 0;
+  let pauses = 0;
+  let pausedUntil: number | undefined;
+  let pauseReason = "";
+  /** Outcomes on this session branch, for /compaction status. */
+  let tallies = new Map<TallyKey, { count: number; ms: number }>();
   /** Records waiting for a safe moment to be written (see persist()). */
   const pending: RunRecord[] = [];
 
@@ -236,6 +294,49 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     return ctx.modelRegistry.find(provider, id);
   }
 
+  function isPaused(): boolean {
+    return pausedUntil !== undefined && now() < pausedUntil;
+  }
+
+  /** Records a failed run of the selected model; returns true when that starts a pause. */
+  function noteFailure(timedOut: boolean): boolean {
+    failures++;
+    if (!timedOut && failures < FAILURES_BEFORE_PAUSE) return false;
+    pauseReason = timedOut ? "after a time-out" : `after ${failures} failures in a row`;
+    pauses++;
+    pausedUntil = now() + Math.min(PAUSE_MAX_MS, PAUSE_BASE_MS * 2 ** (pauses - 1));
+    failures = 0;
+    return true;
+  }
+
+  /** A success, or any settings change, resumes the selected model. */
+  function clearPause() {
+    failures = 0;
+    pauses = 0;
+    pausedUntil = undefined;
+  }
+
+  function pauseNotice(): string {
+    return `The selected model is paused until ${clockTime(pausedUntil ?? now())} ${pauseReason}: automatic compactions use Pi's normal compaction meanwhile. /compaction now still tries it; /compaction on resumes it.`;
+  }
+
+  function tally(value: RunRecord) {
+    const key: TallyKey = value.outcome === "success" ? value.route : value.outcome;
+    const entry = tallies.get(key) ?? { count: 0, ms: 0 };
+    entry.count++;
+    entry.ms += value.durationMs;
+    tallies.set(key, entry);
+  }
+
+  function tallyLine(): string | undefined {
+    const parts = TALLY_LABELS.flatMap(([key, label]) => {
+      const entry = tallies.get(key);
+      if (!entry) return [];
+      return [key === "failed" || key === "cancelled" ? `${entry.count} ${label}` : `${entry.count} ${label} (avg ${formatDuration(entry.ms / entry.count)})`];
+    });
+    return parts.length ? `This branch: ${parts.join(" · ")}` : undefined;
+  }
+
   function statusLine(ctx: ExtensionContext): { text: string; tone: Tone } {
     if (active) {
       const parts = [`Cmp: ${active.label}`];
@@ -257,7 +358,10 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
       text = "Cmp: choose model · main";
     } else {
       const model = findSelected(ctx);
-      if (model) {
+      if (model && isPaused() && config.fallback) {
+        tone = "warning";
+        text = `Cmp: ${safeLabel(model.name || model.id)} · paused until ${clockTime(pausedUntil!)} · main`;
+      } else if (model) {
         // The level actually sent: models with a reasoning floor or ceiling clamp the request.
         text = `Cmp: ${safeLabel(model.name || model.id)} · ${effectiveThinking(model, config.thinking)}${config.scope === "auto" ? " · auto only" : ""}`;
       } else {
@@ -278,6 +382,12 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     timer = undefined;
   }
 
+  function show(ctx: ExtensionContext, value: string | undefined) {
+    if (value === shown) return;
+    ctx.ui.setStatus(STATUS_KEY, value);
+    shown = value;
+  }
+
   /**
    * The status segment is cosmetic: it must never throw into a compaction, or out of the
    * one-second timer (an uncaught exception there would take down the whole Pi process).
@@ -290,11 +400,11 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
       }
       if (!config.showStatus) {
         stopTimer();
-        ctx.ui.setStatus(STATUS_KEY, undefined);
+        show(ctx, undefined);
         return true;
       }
       const { text, tone } = statusLine(ctx);
-      ctx.ui.setStatus(STATUS_KEY, ctx.mode === "tui" ? ctx.ui.theme.fg(tone, text) : text);
+      show(ctx, ctx.mode === "tui" ? ctx.ui.theme.fg(tone, text) : text);
       // Elapsed time refreshes every second while a compaction runs (terminal only).
       if (active && ctx.mode === "tui") {
         if (!timer) {
@@ -375,16 +485,20 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
 
   function restore(entries: SessionEntry[]) {
     last = undefined;
+    tallies = new Map();
     let compactionId: string | undefined;
     for (const entry of entries) {
       if (entry.type === "compaction") {
         compactionId = entry.id;
         // A compaction without our metadata clears the display rather than showing an older result.
         last = embeddedRecord(entry.details);
+        if (last) tally(last);
       } else if (entry.type === "custom" && entry.customType === STATS_TYPE) {
         const value = readRunRecord(entry.data);
+        if (!value) continue;
+        tally(value);
         // A deferred record names its compaction; one written after a newer compaction is stale.
-        if (value && (value.compactionId === undefined || value.compactionId === compactionId)) last = value;
+        if (value.compactionId === undefined || value.compactionId === compactionId) last = value;
       }
     }
   }
@@ -393,6 +507,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     config = store.update(patch);
     configError = undefined;
     warnedConfigError = undefined;
+    clearPause();
     render(ctx);
   }
 
@@ -426,7 +541,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     const thinking = model ? effectiveThinking(model, config.thinking) : config.thinking;
     const lines = [
       `Fast compaction: ${!config.enabled ? "off (normal Pi compaction)" : config.model ? "on" : "on, but no model selected (normal Pi compaction)"}`,
-      `Model: ${config.model ?? "not selected — normal Pi compaction until selected"}`,
+      `Model: ${config.model ? `${config.model}${model?.name ? ` (${safeLabel(model.name)})` : ""}` : "not selected — normal Pi compaction until selected"}`,
       `Thinking: ${config.thinking}${thinking !== config.thinking ? ` (this model uses ${thinking})` : ""} — independent of coding-model thinking`,
       `Scope: ${config.scope === "both" ? "automatic and manual" : "automatic only"}`,
       `Prose target: ${config.targetWords || "off"} words (soft; file lists excluded)`,
@@ -446,12 +561,16 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     }
     const advice = sizingAdvice(config, thinking);
     if (advice) lines.push(`Warning: ${advice}`);
+    if (isPaused() && config.fallback) lines.push(`Paused: ${pauseNotice()}`);
     if (active) lines.push(`Running: ${active.model} · ${active.route} · ${formatDuration(now() - active.started)}`);
     if (last) {
       const tokens = last.outputTokens !== undefined ? ` · ${formatTokens(last.outputTokens)} output tokens` : "";
-      lines.push(`Last: ${last.outcome} · ${last.route} · ${last.model} · ${last.thinking} · ${formatDuration(last.durationMs)}${tokens}${last.condensed ? " · condensed retry" : ""} · ${last.timestamp}`);
+      const age = formatAge(now() - Date.parse(last.timestamp));
+      lines.push(`Last: ${last.outcome} · ${last.route} · ${last.model} · ${last.thinking} · ${formatDuration(last.durationMs)}${tokens}${last.condensed ? " · condensed retry" : ""} · ${age ?? last.timestamp}`);
       if (last.servedModel) lines.push(`Served model (reported by response): ${last.servedModel}`);
     }
+    const history = tallyLine();
+    if (history) lines.push(history);
     if (lastError) lines.push(`Last error: ${lastError}`);
     if (configError) lines.push(`Settings error: ${configError} (run /compaction reset to replace the file with defaults)`);
     notify(ctx, lines.join("\n"), "info");
@@ -591,6 +710,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     config = store.reset();
     configError = undefined;
     warnedConfigError = undefined;
+    clearPause();
     render(ctx);
     notify(ctx, "Fast compaction settings reset. Choose a model with /compaction model.", "info");
   }
@@ -693,6 +813,10 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     description: "Choose compaction model, reasoning, on/off, summary size, time limit, fallback and status",
     getArgumentCompletions: completions,
     handler: async (args, ctx) => {
+      if (inactive) {
+        notify(ctx, "This copy of pi-fast-compaction is inactive because another copy is loaded in this session. Use the other copy's /compaction command, or remove one copy.", "warning");
+        return;
+      }
       try {
         await handle(args, ctx);
       } catch (error) {
@@ -702,23 +826,32 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
   });
 
   pi.on("session_start", (_event, ctx) => {
+    const owner = owners.get(ctx.sessionManager);
+    inactive = owner !== undefined && owner !== instance;
+    if (inactive) {
+      notify(ctx, "pi-fast-compaction is loaded more than once in this session (e.g. the installed package plus pi -e). This copy stays inactive so each compaction is summarized once; remove the extra copy.", "warning");
+      return;
+    }
+    owners.set(ctx.sessionManager, instance);
     registry = ctx.modelRegistry;
     hintedNoModel = false;
+    shown = null;
     load(ctx);
     restore(ctx.sessionManager.getBranch());
     render(ctx);
   });
   pi.on("session_tree", (_event, ctx) => {
+    if (inactive) return;
     // Unwritten records belong to the branch that was left.
     pending.length = 0;
     restore(ctx.sessionManager.getBranch());
     render(ctx);
   });
-  pi.on("before_agent_start", (_event, ctx) => { flushPending(ctx); load(ctx); render(ctx); });
-  pi.on("turn_start", (_event, ctx) => { flushPending(ctx); });
-  pi.on("agent_end", (_event, ctx) => { flushPending(ctx); });
-  pi.on("agent_settled", (_event, ctx) => { flushPending(ctx); });
-  pi.on("model_select", (_event, ctx) => { render(ctx); });
+  pi.on("before_agent_start", (_event, ctx) => { if (inactive) return; flushPending(ctx); load(ctx); render(ctx); });
+  pi.on("turn_start", (_event, ctx) => { if (!inactive) flushPending(ctx); });
+  pi.on("agent_end", (_event, ctx) => { if (!inactive) flushPending(ctx); });
+  pi.on("agent_settled", (_event, ctx) => { if (!inactive) flushPending(ctx); });
+  pi.on("model_select", (_event, ctx) => { if (!inactive) render(ctx); });
 
   async function runFast(event: SessionBeforeCompactEvent, ctx: ExtensionContext, snapshot: Config, run: Run): Promise<CompactionResult> {
     if (!snapshot.model) throw new Error("No compaction model selected. Use /compaction model.");
@@ -736,7 +869,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     // Not unref'd: this timer is what resolves a stall, so it must keep the process alive.
     // It is bounded and always cleared when the run settles.
     const deadline = snapshot.timeoutSeconds > 0
-      ? setTimeout(() => { timedOut = true; limit.abort(); }, snapshot.timeoutSeconds * 1000)
+      ? setTimeout(() => { timedOut = true; run.timedOut = true; limit.abort(); }, snapshot.timeoutSeconds * 1000)
       : undefined;
     const stopIfInterrupted = () => {
       // Only Pi's compaction signal means the user cancelled. A time-out is a failure.
@@ -750,8 +883,10 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     const usages: Usage[] = [];
     const stream: StreamFn = (requestedModel, context, options) => {
       stopIfInterrupted();
+      // The signal passed to this summary call: the run's, or one that also ends a sibling request.
+      const requestSignal = options?.signal ?? signal;
+      if (requestSignal.aborted) throw abortError();
       const budget = outputBudget(context, requestedModel, snapshot);
-      run.streamed = 0;
       // Token-budget adapters may add thinking to maxTokens. Bound the model cap too,
       // without mutating the shared registry model or the coding model.
       const request = ctx.modelRegistry.streamSimple({ ...requestedModel, maxTokens: budget }, context, {
@@ -760,7 +895,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
         reasoning: thinking === "off" ? undefined : thinking,
         thinkingBudgets: THINKING_BUDGETS,
         maxTokens: budget,
-        signal,
+        signal: requestSignal,
         cacheRetention: "none",
       });
       observe(request, run);
@@ -768,7 +903,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
       request.result = async () => {
         let response;
         try {
-          response = await untilAborted(result(), signal);
+          response = await untilAborted(result(), requestSignal);
         } catch (error) {
           stopIfInterrupted();
           throw error;
@@ -792,12 +927,56 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
       onRetryScheduled: (attempt, max) => { run.retry = `${attempt}/${max}`; render(ctx); },
       onRetryFinished: () => { run.retry = undefined; render(ctx); },
     };
+    const call = (preparation: Preparation, callSignal: AbortSignal, instructions: string) => summarize(
+      preparation, model, undefined, undefined, instructions, callSignal, thinking, stream, undefined, retry, callbacks,
+    );
+    /**
+     * Pi summarizes the two halves of a split turn one after the other, although the turn
+     * prefix never sees the history summary. Run both through Pi's compact() at once, and
+     * join them where Pi would: at a unique marker given as the history placeholder.
+     */
+    const parallelSplit = async (instructions: string): Promise<CompactionResult> => {
+      const p = event.preparation;
+      const marker = `\u0000fast-compaction-history-${randomUUID()}\u0000`;
+      const sibling = new AbortController();
+      const callSignal = AbortSignal.any([signal, sibling.signal]);
+      // The first failure ends the other half, so a doomed attempt stops consuming tokens.
+      const guard = (promise: Promise<CompactionResult>) => promise.catch((error: unknown) => { sibling.abort(); throw error; });
+      let history: CompactionResult;
+      let prefix: CompactionResult;
+      try {
+        [history, prefix] = await Promise.all([
+          // History only, without the file lists: the turn half appends those once.
+          guard(call({ ...p, isSplitTurn: false, turnPrefixMessages: [], fileOps: { read: new Set(), written: new Set(), edited: new Set() } }, callSignal, instructions)),
+          guard(call({ ...p, messagesToSummarize: [], previousSummary: marker }, callSignal, instructions)),
+        ]);
+      } catch (error) {
+        if (event.signal.aborted || timedOut || hitLength) throw error;
+        // Some gateways reject concurrent requests. Retry Pi's own sequence once, and keep it
+        // for this session when the failure looks like a rate or concurrency limit.
+        if (/(?<![a-z0-9])429(?![a-z0-9])|rate.?limit|too many requests|concurren/iu.test(error instanceof Error ? error.message : String(error))) {
+          parallelSplitUnsupported = true;
+        }
+        return call(p, signal, instructions);
+      }
+      if (!prefix.summary.startsWith(marker)) {
+        // Pi's split-turn format changed: never risk a malformed checkpoint; use Pi's own sequence.
+        parallelSplitUnsupported = true;
+        return call(p, signal, instructions);
+      }
+      return {
+        ...prefix,
+        summary: history.summary + prefix.summary.slice(marker.length),
+        usage: history.usage && prefix.usage ? addUsage(history.usage, prefix.usage) : history.usage ?? prefix.usage,
+      };
+    };
     const attempt = async (condensed: boolean) => {
-      const result = await summarize(
-        event.preparation, model, undefined, undefined,
-        buildInstructions(snapshot, event.preparation, event.customInstructions, condensed), signal,
-        thinking, stream, undefined, retry, callbacks,
-      );
+      const p = event.preparation;
+      const instructions = buildInstructions(snapshot, p, event.customInstructions, condensed);
+      run.streamed = 0;
+      const result = !parallelSplitUnsupported && p.isSplitTurn && p.turnPrefixMessages.length > 0 && p.messagesToSummarize.length > 0
+        ? await parallelSplit(instructions)
+        : await call(p, signal, instructions);
       stopIfInterrupted();
       const problem = checkpointProblem(result.summary);
       if (problem) throw new Error(problem);
@@ -826,9 +1005,10 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
   }
 
   pi.on("session_before_compact", async (event, ctx): Promise<SessionBeforeCompactResult | undefined> => {
+    if (inactive) return;
     load(ctx);
     // Do this even when disabled or falling back, to preserve cumulative files in native compaction.
-    carryFileOperations(event);
+    try { carryFileOperations(event); } catch { /* metadata recovery must never break compaction */ }
     const run = begin(ctx, event.reason);
     const mainOnce = event.reason === "manual" && forceMainOnce;
     if (mainOnce) forceMainOnce = false;
@@ -838,54 +1018,75 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
       if (!hintedNoModel) run.hint = "Fast compaction has no model selected yet, so Pi's normal compaction was used. Choose one with /compaction model.";
       return;
     }
+    if (!apiCompatible || typeof ctx.modelRegistry?.streamSimple !== "function") {
+      if (!warnedIncompatible) {
+        warnedIncompatible = true;
+        notify(ctx, "This Pi version's compaction API differs from what pi-fast-compaction expects, so Pi's normal compaction is used. Update the extension.", "warning");
+      }
+      return;
+    }
     const snapshot = { ...config };
     if (event.signal.aborted) return { cancel: true };
+    // While paused after failures, automatic compaction skips the selected model; a manual one still tries it.
+    if (snapshot.fallback && event.reason !== "manual" && isPaused()) {
+      Object.assign(run, { route: "fallback", paused: true, error: `paused until ${clockTime(pausedUntil!)} ${pauseReason}` });
+      render(ctx);
+      return;
+    }
     try {
       const result = await runFast(event, ctx, snapshot, run);
+      clearPause();
       const details = result.details && typeof result.details === "object" ? result.details : {};
       return { compaction: { ...result, details: { ...details, [DETAILS_KEY]: record(run, "success", { outputTokens: run.outputTokens }) } } };
     } catch (error) {
       if (event.signal.aborted) return { cancel: true };
       run.error = lastError = safeError(error);
       if (!snapshot.fallback) {
+        // No pause without fallback: there is no alternative to keep trying.
         run.policyFailure = true;
         notify(ctx, `Fast compaction failed; no summary saved. ${run.error}`, "error");
         return { cancel: true };
       }
+      const pausedNow = noteFailure(run.timedOut === true);
       Object.assign(run, {
         route: "fallback", model: ctx.model ? modelKey(ctx.model) : "main",
         label: safeLabel(ctx.model?.name || ctx.model?.id || "main"),
         thinking: ctx.thinkingLevel ?? "off", targetWords: 0, streamed: 0,
         servedModel: undefined, retry: undefined, condensed: undefined, outputTokens: undefined,
       });
-      notify(ctx, `Fast compaction unavailable; falling back to normal Pi compaction. ${run.error}`, "warning");
+      if (pausedNow) run.hint = pauseNotice();
+      notify(ctx, `Fast compaction unavailable; falling back to normal Pi compaction. ${run.error}${pausedNow ? `\n${pauseNotice()}` : ""}`, "warning");
       render(ctx);
       return;
     }
   });
 
   pi.on("session_compact", (event, ctx) => {
+    if (inactive) return;
     const run = active;
     active = undefined;
     const embedded = event.fromExtension ? embeddedRecord(event.compactionEntry.details) : undefined;
     if (embedded) {
       last = embedded;
+      tally(last);
     } else if (run) {
       if (event.fromExtension) run.route = "other-extension";
       last = record(run, "success", { outputTokens: event.compactionEntry.usage?.output, compactionId: event.compactionEntry.id });
+      tally(last);
       persist(ctx, last);
-      if (run.route === "fallback" && run.error && ctx.mode === "tui") {
-        noticeAfterCompaction(ctx, `Compacted with the coding model because the fast model failed: ${run.error}`, "warning");
+      // Repeat the reason after Pi's redraw; a run skipped during a pause stays quiet (the status shows it).
+      if (run.route === "fallback" && run.error && !run.paused && ctx.mode === "tui") {
+        noticeAfterCompaction(ctx, `Compacted with the coding model because the fast model failed: ${run.error}${run.hint ? `\n${run.hint}` : ""}`, "warning");
+      } else if (run.hint && run.route !== "fallback" && !hintedNoModel) {
+        hintedNoModel = true;
+        noticeAfterCompaction(ctx, run.hint, "info");
       }
-    }
-    if (run?.hint && !hintedNoModel) {
-      hintedNoModel = true;
-      noticeAfterCompaction(ctx, run.hint, "info");
     }
     render(ctx);
   });
 
   pi.on("session_compact_failed", (event, ctx) => {
+    if (inactive) return;
     if (manualPending && event.reason === "manual") manualFailureReported = true;
     const run = active;
     active = undefined;
@@ -896,12 +1097,17 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
         run.error ??= lastError;
       }
       last = record(run, run.policyFailure || !event.aborted ? "failed" : "cancelled");
+      tally(last);
       persist(ctx, last);
     }
     render(ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    if (inactive) return;
+    try {
+      if (owners.get(ctx.sessionManager) === instance) owners.delete(ctx.sessionManager);
+    } catch { /* already torn down */ }
     stopTimer();
     active = undefined;
     manualPending = false;
@@ -910,6 +1116,7 @@ export function installExtension(pi: ExtensionAPI, dependencies: Dependencies = 
     // Save what can be saved safely; anything that would directly follow a compaction is dropped.
     flushPending(ctx);
     pending.length = 0;
+    shown = null;
     try {
       if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
     } catch { /* already torn down */ }

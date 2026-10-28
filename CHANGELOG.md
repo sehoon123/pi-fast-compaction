@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0
+
+### Performance
+
+- **Split-turn compactions run both summary requests at once.** When the cut point falls inside the current turn — common in long agentic turns — Pi requests the history summary and the turn-prefix summary one after the other, although they are independent. Both now go through Pi's own `compact()` concurrently and are joined exactly where Pi joins them; a real-host test checks the checkpoint is byte-identical to Pi's sequential one. A failing half cancels the other, and Pi's own sequence is then tried once, so gateways that reject concurrent requests keep working (after a rate or concurrency limit error, the session stays sequential). If a future Pi changes the format, the extension detects it and uses Pi's sequence.
+- The status segment is only updated when its text changes, avoiding a TUI redraw (or RPC message) on every prompt.
+
+### Reliability
+
+- **Pause after failures.** During an outage, every automatic compaction waited up to the full time limit again. After a time-out, or 3 failed runs in a row, the selected model is paused for 10 minutes, doubling up to an hour; automatic compactions use Pi's normal compaction meanwhile and the status shows `paused until HH:MM`. Manual compaction still tries it; a success or any settings change (e.g. `/compaction on`) resumes it. Never with fallback off.
+- **A second loaded copy stays inactive.** The installed package plus `pi -e ./src/index.ts` used to summarize every compaction twice and fight over the status segment. The first copy in a session now owns it; others warn and stay out of compaction, status and commands. Sessions in one SDK process are unaffected.
+- An incompatible Pi compaction API (e.g. a changed `compact()` signature) is detected: normal compaction with one warning, instead of a failed attempt on every compaction.
+- File-tracking recovery can no longer break a compaction if Pi's event shape changes.
+
+### Improved
+
+- `/compaction status` lists outcomes on the current branch (`This branch: 5 fast (avg 21s) · 1 fallback (avg 1m40s)`), shows how long ago the last result was, and the selected model's display name.
+
 ## 0.3.1
 
 ### Fixed

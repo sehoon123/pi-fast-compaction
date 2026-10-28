@@ -4,6 +4,8 @@ import test from "node:test";
 import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DEFAULTS } from "../src/config.ts";
 import { DETAILS_KEY } from "../src/summary.ts";
+import { compact } from "@earendil-works/pi-coding-agent";
+import { isCompatibleCompact } from "../src/extension.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { afterTimers, event, fast, harness, main, response, settle, stalledStream, usage } from "./helpers.ts";
 
@@ -660,4 +662,179 @@ test("fallback results are explained again after Pi redraws the chat", async (t)
   const note = h.notifications.at(-1)!;
   assert.equal(note.type, "warning");
   assert.match(note.text, /Compacted with the coding model because the fast model failed: .*401/u);
+});
+
+function splitEvent(patch: Parameters<typeof event>[0] = {}) {
+  const e = event(patch);
+  e.preparation.previousSummary = "Old checkpoint.";
+  e.preparation.isSplitTurn = true;
+  e.preparation.turnPrefixMessages = [{ role: "user", content: "Current request: continue patching.", timestamp: 2 }];
+  return e;
+}
+
+test("both halves of a split turn are requested at once; a failing half cancels the other", async (t) => {
+  const h = harness(t);
+  const ends: ((message: ReturnType<typeof response>) => void)[] = [];
+  h.setStream((_model, _context, options) => {
+    const stream = createAssistantMessageEventStream();
+    ends.push((message) => stream.end(message));
+    options?.signal?.addEventListener("abort", () => stream.end(response({ stopReason: "aborted", content: [] })), { once: true });
+    return stream;
+  });
+  const pending = h.emit("session_before_compact", splitEvent());
+  await settle();
+  assert.equal(h.requests.length, 2, "the turn prefix does not wait for the history summary");
+  for (const end of ends) end(response());
+  const result = await pending;
+  assert.match(result.compaction.summary, /^## Goal[\s\S]*Turn Context \(split turn\)/u);
+  for (const request of h.requests) assert.doesNotMatch(JSON.stringify(request.context), /fast-compaction-history/u);
+  ends.length = 0;
+  const failing = h.emit("session_before_compact", splitEvent());
+  await settle();
+  ends[0](response({ stopReason: "error", errorMessage: "401 invalid x-api-key" }));
+  await settle();
+  assert.equal(h.requests[3].options?.signal?.aborted, true, "the sibling request is cancelled, not left running");
+  assert.equal(h.requests.length, 5, "then Pi's own sequence is tried once");
+  ends.at(-1)!(response({ stopReason: "error", errorMessage: "401 invalid x-api-key" }));
+  assert.equal(await failing, undefined, "falls back");
+});
+
+test("a gateway that rejects concurrent requests gets Pi's sequence, for the rest of the session", async (t) => {
+  const h = harness(t);
+  // One request at a time: a second concurrent request is rejected (also on retry), and an
+  // aborted request frees its slot, as a client disconnect would.
+  let inFlight = 0;
+  h.setStream((_model, _context, options) => {
+    const stream = createAssistantMessageEventStream();
+    const limited = ++inFlight > 1;
+    let done = false;
+    const finish = (message: ReturnType<typeof response>) => { if (!done) { done = true; inFlight--; stream.end(message); } };
+    options?.signal?.addEventListener("abort", () => finish(response({ stopReason: "aborted", content: [] })), { once: true });
+    if (limited) setImmediate(() => finish(response({ stopReason: "error", errorMessage: "429 Too many concurrent requests" })));
+    else setTimeout(() => finish(response()), 20);
+    return stream;
+  });
+  const first = await h.emit("session_before_compact", splitEvent());
+  assert.match(first.compaction.summary, /Turn Context/u, "succeeds with the selected model, no fallback");
+  assert.doesNotMatch(h.notifications.map((n) => n.text).join("\n"), /falling back/u);
+  const count = h.requests.length;
+  assert.ok((await h.emit("session_before_compact", splitEvent())).compaction);
+  assert.equal(h.requests.length, count + 2, "later split turns are sequential: no more rejected attempts");
+});
+
+test("if Pi's split-turn format ever changes, the halves are summarized sequentially from then on", async (t) => {
+  // A Pi whose turn-prefix result no longer starts with the history placeholder.
+  const h = harness(t, { summarize: async (...args: Parameters<typeof compact>) => {
+    const result = await compact(...args);
+    return args[0].messagesToSummarize.length ? result : { ...result, summary: `Changed format.\n${result.summary}` };
+  } });
+  const first = await h.emit("session_before_compact", splitEvent());
+  assert.doesNotMatch(first.compaction.summary, /fast-compaction-history|Changed format/u);
+  assert.match(first.compaction.summary, /Turn Context/u);
+  assert.equal(h.requests.length, 4, "the parallel attempt is discarded and Pi's own sequence is used");
+  await h.emit("session_before_compact", splitEvent());
+  assert.equal(h.requests.length, 6, "later split turns go straight to the sequential path");
+});
+
+test("a time-out pauses the selected model for automatic compaction; manual compaction still tries it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const h = harness(t);
+  h.store.update({ timeoutSeconds: 30 });
+  h.setStream(stalledStream(true));
+  const stalled = h.emit("session_before_compact", event({ reason: "threshold" }));
+  await settle();
+  t.mock.timers.tick(30_000);
+  assert.equal(await stalled, undefined);
+  assert.match(h.notifications.at(-1)!.text, /paused until \d\d:\d\d after a time-out/u);
+  await commit(h, undefined, false);
+  assert.match(h.statuses.at(-1)!, /Haiku test · paused until \d\d:\d\d · main/u);
+  userMessage(h);
+  // While paused, automatic compaction does not wait for the selected model again.
+  assert.equal(await h.emit("session_before_compact", event({ reason: "threshold" })), undefined);
+  assert.equal(h.requests.length, 1);
+  await commit(h, undefined, false);
+  assert.match(h.statuses.at(-1)!, /last \d+s \(fallback\)/u);
+  userMessage(h);
+  h.setStream(undefined);
+  assert.ok((await h.emit("session_before_compact", event({ reason: "manual" }))).compaction, "an explicit compaction tries it");
+  assert.equal(h.requests.length, 2);
+  await h.command("status");
+  assert.doesNotMatch(h.notifications.at(-1)!.text, /Paused:/u, "a success resumes the model");
+});
+
+test("three failures in a row pause the model; pauses double; a settings change resumes it; never with fallback off", async (t) => {
+  const h = harness(t);
+  h.setResponse(response({ stopReason: "error", errorMessage: "401 invalid x-api-key" }));
+  for (let i = 0; i < 2; i++) await h.emit("session_before_compact", event({ reason: "threshold" }));
+  assert.doesNotMatch(h.notifications.at(-1)!.text, /paused/u, "two failures: keep trying");
+  await h.emit("session_before_compact", event({ reason: "threshold" }));
+  assert.match(h.notifications.at(-1)!.text, /paused until .* after 3 failures in a row/u);
+  await h.command("status");
+  assert.match(h.notifications.at(-1)!.text, /Paused: The selected model is paused until/u);
+  const requests = h.requests.length;
+  await h.emit("session_before_compact", event({ reason: "threshold" }));
+  assert.equal(h.requests.length, requests, "skipped while paused");
+  await h.command("on");
+  await h.emit("session_before_compact", event({ reason: "threshold" }));
+  assert.equal(h.requests.length, requests + 1, "/compaction on resumes it");
+  h.store.update({ fallback: false });
+  for (let i = 0; i < 4; i++) await h.emit("session_before_compact", event({ reason: "threshold" }));
+  assert.equal(h.requests.length, requests + 5, "without fallback there is no alternative, so it keeps trying");
+});
+
+test("a second loaded copy stays inactive, so each compaction is summarized once", async (t) => {
+  const h = harness(t);
+  h.installAgain();
+  await h.emit("session_start");
+  assert.match(h.notifications.at(-1)!.text, /loaded more than once.*This copy stays inactive/u);
+  const result = await h.emit("session_before_compact", event());
+  assert.ok(result.compaction);
+  assert.equal(h.requests.length, 1, "not two summaries");
+  await h.command("status");
+  assert.match(h.notifications.at(-1)!.text, /This copy of pi-fast-compaction is inactive/u);
+  await h.emit("session_shutdown");
+  await h.emit("session_start");
+  assert.equal(h.requests.length, 1);
+});
+
+test("an incompatible Pi API uses Pi's normal compaction with one warning", async (t) => {
+  assert.equal(isCompatibleCompact(compact), true);
+  assert.equal(isCompatibleCompact((options: unknown) => options), false, "e.g. a future options-object signature");
+  const h = harness(t);
+  (h.ctx.modelRegistry as any).streamSimple = undefined;
+  assert.equal(await h.emit("session_before_compact", event()), undefined);
+  assert.equal(await h.emit("session_before_compact", event()), undefined);
+  assert.equal(h.notifications.filter((n) => /compaction API differs/u.test(n.text)).length, 1);
+});
+
+test("status reports outcomes on this branch and how long ago the last one was", async (t) => {
+  const h = harness(t);
+  h.setRequestMs(20000);
+  await commit(h, await h.emit("session_before_compact", event()));
+  userMessage(h);
+  h.setResponse(response({ stopReason: "error", errorMessage: "401 invalid x-api-key" }));
+  await h.emit("session_before_compact", event());
+  h.setTime(200_000);
+  await commit(h, undefined, false);
+  userMessage(h);
+  await h.emit("session_before_compact", event());
+  await h.emit("session_compact_failed", { reason: "threshold", aborted: false, errorMessage: "Auto-compaction failed: boom" });
+  h.setTime(500_000);
+  await h.emit("agent_end");
+  await h.emit("session_start");
+  await h.command("status");
+  const text = h.notifications.at(-1)!.text;
+  assert.match(text, /This branch: 1 fast \(avg 20s\) · 1 fallback \(avg \d+m\d\ds\) · 1 failed/u);
+  assert.match(text, /Last: failed · fallback .* · \dm ago/u);
+  assert.match(text, /Model: fixture\/haiku-test \(Haiku test\)/u);
+});
+
+test("unchanged status text is not sent again", async (t) => {
+  const h = harness(t);
+  await h.emit("session_start");
+  const count = h.statuses.length;
+  for (let i = 0; i < 5; i++) await h.emit("before_agent_start");
+  assert.equal(h.statuses.length, count, "each update redraws the TUI or sends an RPC message");
+  await h.command("thinking high");
+  assert.equal(h.statuses.length, count + 1);
 });

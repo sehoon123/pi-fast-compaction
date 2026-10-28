@@ -1,6 +1,6 @@
 {
   "name": "pi-fast-compaction",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Choose a separate compaction model in Pi, with persistent controls, bounded summaries, a time limit, safe fallback, and a live status bar.",
   "type": "module",
   "license": "MIT",

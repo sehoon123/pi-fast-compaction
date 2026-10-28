@@ -10,7 +10,7 @@ import {
 import { ConfigStore } from "../src/config.ts";
 import { temporary } from "./helpers.ts";
 
-type Options = { model?: string | null; fallback?: boolean; ui?: object };
+type Options = { model?: string | null; fallback?: boolean; enabled?: boolean; ui?: object };
 
 /**
  * Uses Pi's actual resource loader, Jiti extension mapping, provider runtime, command
@@ -25,7 +25,7 @@ async function host(t: TestContext, options: Options = {}) {
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
   });
   const store = new ConfigStore(join(dir, "fast-compaction.json"));
-  store.update({ model: options.model === undefined ? "compaction-host/fast" : options.model, fallback: options.fallback ?? true });
+  store.update({ model: options.model === undefined ? "compaction-host/fast" : options.model, fallback: options.fallback ?? true, enabled: options.enabled ?? true });
   const provider = fauxProvider({
     provider: "compaction-host",
     models: [
@@ -175,4 +175,42 @@ test("actual Pi host: a fresh install without a model leaves Pi's compaction alo
   assert.match(notifications[0].message, /no model selected yet.*\/compaction model/u);
   assert.ok(statuses.every((text) => !/fallback|failed/u.test(text ?? "")), JSON.stringify(statuses));
   assert.equal(errors.length, 0, JSON.stringify(errors));
+});
+
+test("actual Pi host: split turns summarize both halves at once, with exactly Pi's sequential result", async (t) => {
+  const agentDir = process.env.PI_CODING_AGENT_DIR;
+  t.after(() => {
+    if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = agentDir;
+  });
+  // Answers depend only on which half is asked, so both runs receive identical text.
+  const isTurnPrefix = (context: unknown) => /earlier context from an ongoing conversation/u.test(JSON.stringify(context));
+  const run = async (enabled: boolean) => {
+    const { provider, manager, session, errors } = await host(t, { enabled });
+    // The newest entry is an assistant message inside the current turn: the cut splits it.
+    manager.appendMessage(fauxAssistantMessage("Working on the fix now."));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const calls: string[] = [];
+    const respond = async (context: unknown, _options: unknown, _state: unknown, model: { id: string }) => {
+      calls.push(model.id);
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      inFlight--;
+      return fauxAssistantMessage(isTurnPrefix(context) ? "## Original Request\nContinue the fix." : "## Goal\nKeep the API compatible.");
+    };
+    provider.setResponses([respond, respond]);
+    const result = await session.compact();
+    assert.equal(errors.length, 0, JSON.stringify(errors));
+    return { summary: result.summary, calls, maxInFlight };
+  };
+  const native = await run(false);
+  const fast = await run(true);
+  assert.deepEqual(native.calls, ["main", "main"]);
+  assert.equal(native.maxInFlight, 1, "Pi itself runs the halves one after the other");
+  assert.deepEqual(fast.calls, ["fast", "fast"]);
+  assert.equal(fast.maxInFlight, 2, "the extension runs them at once");
+  assert.match(fast.summary, /Turn Context \(split turn\)/u);
+  assert.equal(fast.summary, native.summary, "byte-identical to Pi's own split-turn checkpoint");
+  assert.doesNotMatch(fast.summary, /fast-compaction-history/u);
 });
